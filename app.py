@@ -34,7 +34,6 @@ app.include_router(server_router)
 app.include_router(lora_router)
 
 topo_client: GroupTopoClient = None
-motor_client = None
 
 # Middleware to collect metrics
 @app.middleware("http")
@@ -125,69 +124,6 @@ def run_topo_client(worker_instance_info: str) -> GroupTopoClient:
         sys.exit(1)
 
 
-def stop_motor_client_signal_handler(signal, frame):
-    global motor_client
-    if motor_client is not None:
-        motor_client.unregister()
-    sys.exit(0)
-
-
-def run_motor_integration(worker_instance_info: str):
-    """Start the MindIE Motor Coordinator integration client.
-
-    Parses the same --instance-info JSON, creates a MotorCoordinatorClient,
-    waits for the engine to be ready, registers the instance, and maintains
-    a heartbeat-driven registration loop.
-
-    This is an independent control-plane integration (not engine topology):
-    it is enabled separately via the MOTOR_COORDINATOR_ENDPOINT env var and
-    can coexist with the engine-native router registration.
-    """
-    logger = init_logger(__name__)
-    logger.info("Starting MindIE Motor integration...")
-
-    worker_dict = None
-    try:
-        worker_dict = json.loads(worker_instance_info)
-    except json.decoder.JSONDecodeError as e:
-        logger.error(f"Failed to decode worker instance info: {worker_instance_info}: {e}")
-        sys.exit(1)
-
-    worker_info = worker_dict.get("data")
-    if worker_info is None:
-        logger.error(f"No worker info found, please set \"data\" field in instance info")
-        sys.exit(1)
-
-    try:
-        global motor_client
-        from patio.integration.motor import MotorCoordinatorClient
-        motor_client = MotorCoordinatorClient(worker_info)
-        motor_client.wait_engine_ready(worker_info)
-        motor_client.register("", worker_info)
-        signal.signal(signal.SIGTERM, stop_motor_client_signal_handler)
-        signal.signal(signal.SIGINT, stop_motor_client_signal_handler)
-
-        # Heartbeat: periodic re-register. This also covers Coordinator
-        # restart recovery (standalone mode has no Controller to re-push state).
-        def _motor_heartbeat_loop():
-            interval = int(envs.HEARTBEAT_INTERVAL)
-            while not EXIT_EVENT.wait(timeout=interval):
-                try:
-                    motor_client.register("", worker_info)
-                    logger.debug("motor heartbeat register ok")
-                except Exception as e:
-                    logger.warning(f"motor heartbeat register failed: {e}")
-
-        t = threading.Thread(target=_motor_heartbeat_loop, daemon=True, name="motor-heartbeat")
-        t.start()
-        logger.info(f"motor heartbeat thread started, interval={envs.HEARTBEAT_INTERVAL}s")
-
-        return motor_client
-    except Exception as e:
-        logger.error(f"Failed to start Motor integration: {e}")
-        sys.exit(1)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Run patio runtime server")
     parser.add_argument(
@@ -216,12 +152,6 @@ def main():
 
     if args.instance_info:
         run_topo_client(args.instance_info)
-        # If a Motor Coordinator endpoint is configured, also register the
-        # engine instance with it. Both registrations can coexist: the engine
-        # topology goes to the native router, the Motor integration registers
-        # with a separate control plane.
-        if envs.MOTOR_COORDINATOR_ENDPOINT:
-            run_motor_integration(args.instance_info)
 
     # Run the server
     try:

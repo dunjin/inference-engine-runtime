@@ -2,18 +2,16 @@
 # @Author: dunjin
 
 """
-MotorCoordinatorClient — register/unregister inference engine instances with a
+MotorTopoClient — register/unregister inference engine instances with a
 standalone MindIE Motor Coordinator via its /instances/refresh management protocol.
 
-This client lives under a dedicated integration/ package rather than topo/client/
-because MindIE Motor Coordinator is a cross-engine control plane, not an inference-engine
-topology router — the abstraction layers differ.
+MindIE Motor Coordinator is a routing/control-plane component of the SAME
+abstraction class as the SGLang router and the vLLM proxy, so this client lives
+under topo/client/ and implements the shared GroupTopoClient interface, exactly
+like SGLangGroupTopoClient and VLLMProxyTopoClient.
 """
 
-import json
 import os
-import threading
-import time
 import traceback
 import zlib
 from typing import Optional
@@ -22,6 +20,8 @@ import requests
 
 from patio import envs
 from patio.logger import init_logger
+from patio.topo.client.base_topo_client import GroupTopoClient
+from patio.topo import utils
 
 logger = init_logger(__name__)
 
@@ -37,9 +37,8 @@ EXTERNAL_DISPATCH_PLAN = "prefill_handoff_decode"
 # Motor standalone currently accepts "vllm" only.
 MOTOR_ENGINE_TYPE = "vllm"
 
-# Retry policy for registration / health checks
-_DEFAULT_RETRY_TIMES = 60
-_DEFAULT_RETRY_INTERVAL = 3
+# Motor management API key header (see mgmt_server_modified.py MGMT_API_KEY_HEADER)
+MOTOR_MGMT_API_KEY_HEADER = "X-Motor-Management-Key"
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +46,43 @@ _DEFAULT_RETRY_INTERVAL = 3
 # ---------------------------------------------------------------------------
 
 
-def _detect_worker_type(worker_info: dict) -> str:
+def get_motor_endpoint() -> str:
+    """Derive the Motor Coordinator management endpoint from RBG env vars.
+
+    Uses the same headless-service DNS shape as the SGLang router / vLLM proxy
+    endpoints (ROUTER_ROLE_NAME / ROUTER_PORT), keeping Motor a first-class
+    routing component rather than a side-channel integration.
+    """
+    rbg_group_name = envs.GROUP_NAME
+    if rbg_group_name is None:
+        raise RuntimeError("RBG_GROUP_NAME is not set")
+
+    router_role_name = envs.ROUTER_ROLE_NAME
+    if router_role_name is None:
+        raise RuntimeError("ROUTER_ROLE_NAME is not set")
+
+    router_port = envs.ROUTER_PORT
+    if router_port is None:
+        raise RuntimeError("ROUTER_PORT is not set")
+
+    return f"{rbg_group_name}-{router_role_name}-0.s-{rbg_group_name}-{router_role_name}:{router_port}"
+
+
+def get_mgmt_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    api_key_file = envs.MOTOR_MGMT_API_KEY_FILE
+    if api_key_file:
+        try:
+            with open(api_key_file, "r") as f:
+                api_key = f.read().strip()
+            if api_key:
+                headers[MOTOR_MGMT_API_KEY_HEADER] = api_key
+        except OSError as e:
+            logger.warning("failed to read motor mgmt api key file %s: %s", api_key_file, e)
+    return headers
+
+
+def detect_worker_type(worker_info: dict) -> str:
     """Extract the worker role (prefill / decode) from worker_info."""
     worker_type = worker_info.get("type") or worker_info.get("worker_type")
     if worker_type is None:
@@ -55,7 +90,7 @@ def _detect_worker_type(worker_info: dict) -> str:
     return worker_type
 
 
-def _get_worker_address(worker_info: dict) -> str:
+def get_worker_address(worker_info: dict) -> str:
     """Return the worker's routable address (host:port).
 
     Resolution order:
@@ -80,7 +115,7 @@ def _get_worker_address(worker_info: dict) -> str:
     raise RuntimeError("cannot determine worker address: set 'instance' field, POD_IP, or RBG env vars")
 
 
-def _derive_instance_id(role: str, address: str) -> int:
+def derive_instance_id(role: str, address: str) -> int:
     """Deterministic instance ID matching Motor's CLI scheme.
 
     Motor CLI (register.py, derive_instance_id):
@@ -88,35 +123,13 @@ def _derive_instance_id(role: str, address: str) -> int:
         digest = crc32(identity) & 0x3FFFFFFF
         return 0x40000000 | digest
     """
-    identity = "{}|{}".format(role, address)
+    identity = "{}|{}".format(role, address.strip())
     digest = zlib.crc32(identity.encode()) & STANDALONE_ID_MASK
     return STANDALONE_ID_NAMESPACE | digest
 
 
-def _get_mgmt_endpoint() -> str:
-    endpoint = envs.MOTOR_COORDINATOR_ENDPOINT
-    if not endpoint:
-        raise RuntimeError("MOTOR_COORDINATOR_ENDPOINT is not set")
-    port = envs.MOTOR_MGMT_PORT
-    return "{}:{}".format(endpoint, port)
-
-
-def _get_mgmt_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    api_key_file = envs.MOTOR_MGMT_API_KEY_FILE
-    if api_key_file:
-        try:
-            with open(api_key_file, "r") as f:
-                api_key = f.read().strip()
-            if api_key:
-                headers["X-Motor-Management-Key"] = api_key
-        except OSError as e:
-            logger.warning("failed to read motor mgmt api key file %s: %s", api_key_file, e)
-    return headers
-
-
-def _build_body(event: str, role: str, address: str, instance_id: int,
-                model_name: Optional[str] = None) -> dict:
+def build_body(event: str, role: str, address: str, instance_id: int,
+               model_name: Optional[str] = None) -> dict:
     """Build an ExternalInsEventMsg-compatible request body."""
     body = {
         "event": event,
@@ -129,7 +142,7 @@ def _build_body(event: str, role: str, address: str, instance_id: int,
                 "endpoints": [
                     {
                         "id": 0,
-                        "address": address,
+                        "address": address.strip(),
                     }
                 ],
             }
@@ -140,56 +153,47 @@ def _build_body(event: str, role: str, address: str, instance_id: int,
     return body
 
 
-# ---------------------------------------------------------------------------
-# retry helper
-# ---------------------------------------------------------------------------
+def _build_health_check_endpoint(worker_info: dict) -> str:
+    """Determine the local health-check address.
 
-
-def _retry(fn, retry_times=_DEFAULT_RETRY_TIMES, interval=_DEFAULT_RETRY_INTERVAL):
-    last_exc = None
-    for attempt in range(1, retry_times + 1):
-        try:
-            return fn()
-        except Exception as e:
-            last_exc = e
-            if attempt < retry_times:
-                logger.warning("attempt %d/%d failed: %s; retrying in %ds", attempt, retry_times, e, interval)
-                time.sleep(interval)
-    raise last_exc
+    Uses POD_IP if available, otherwise falls back to localhost.
+    """
+    port = str(worker_info.get("port", "8000"))
+    pod_ip = os.getenv("POD_IP")
+    return "{}:{}".format(pod_ip, port) if pod_ip else "localhost:{}".format(port)
 
 
 # ---------------------------------------------------------------------------
-# MotorCoordinatorClient
+# MotorTopoClient
 # ---------------------------------------------------------------------------
 
 
-class MotorCoordinatorClient(object):
+class MotorTopoClient(GroupTopoClient):
     """Register / unregister / health-check an inference engine instance with
     a standalone MindIE Motor Coordinator.
 
-    This is NOT a GroupTopoClient: Motor Coordinator is a cross-engine control
-    plane, not an inference-engine topology router.  The method signatures
-    happen to overlap (wait_engine_ready, register, unregister) because both
-    models need lifecycle hooks.
+    Motor Coordinator is a routing/control-plane component of the same class
+    as the SGLang router and the vLLM proxy, so this is a GroupTopoClient just
+    like its topo/client/ siblings.
     """
 
     def __init__(self, worker_info: dict):
         self.worker_info = worker_info
-        self.mgmt_endpoint = _get_mgmt_endpoint()
-        self.mgmt_headers = _get_mgmt_headers()
-        self.role = _detect_worker_type(worker_info).strip().lower()
-        self.address = _get_worker_address(worker_info)
-        self.instance_id = _derive_instance_id(self.role, self.address)
-        self.health_check_endpoint = self._build_health_check_endpoint(worker_info)
+        self.mgmt_endpoint = get_motor_endpoint()
+        self.mgmt_headers = get_mgmt_headers()
+        self.role = detect_worker_type(worker_info).strip().lower()
+        self.address = get_worker_address(worker_info)
+        self.instance_id = derive_instance_id(self.role, self.address)
+        self.health_check_endpoint = _build_health_check_endpoint(worker_info)
 
         self._model_name = envs.MOTOR_MODEL_NAME
         logger.info(
-            "MotorCoordinatorClient: role=%s address=%s instance_id=%d endpoint=%s",
+            "MotorTopoClient: role=%s address=%s instance_id=%d endpoint=%s",
             self.role, self.address, self.instance_id, self.mgmt_endpoint,
         )
 
     # -----------------------------------------------------------------------
-    # public interface
+    # GroupTopoClient interface
     # -----------------------------------------------------------------------
 
     def wait_engine_ready(self, worker_info: dict) -> bool:
@@ -212,7 +216,7 @@ class MotorCoordinatorClient(object):
                 raise RuntimeError("health check request failed: {}".format(e))
 
         try:
-            _retry(_check, retry_times=60, interval=3)
+            utils.retry(_check, retry_times=60, interval=3)
             return True
         except Exception as e:
             logger.error("failed to wait for engine ready: %s", e)
@@ -226,7 +230,7 @@ class MotorCoordinatorClient(object):
         Posts to /instances/refresh with event=add.
         Idempotent when the instance-id already exists on the Coordinator.
         """
-        body = _build_body(
+        body = build_body(
             event="add",
             role=self.role,
             address=self.address,
@@ -238,7 +242,7 @@ class MotorCoordinatorClient(object):
             mgmt_url = "http://{}/instances/refresh".format(self.mgmt_endpoint)
             logger.info(
                 "registering instance to Motor Coordinator: %s  body=%s",
-                mgmt_url, json.dumps(body),
+                mgmt_url, body,
             )
             resp = requests.post(
                 mgmt_url,
@@ -246,7 +250,7 @@ class MotorCoordinatorClient(object):
                 headers=self.mgmt_headers,
                 timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_REGISTER_TIMEOUT),
             )
-            if resp.status_code != 200:
+            if not 200 <= resp.status_code < 300:
                 raise RuntimeError(
                     "register failed, url: {}, status_code: {}, content: {}".format(
                         mgmt_url, resp.status_code, resp.text
@@ -255,7 +259,7 @@ class MotorCoordinatorClient(object):
             logger.info("registered instance %d (%s) successfully", self.instance_id, self.role)
 
         try:
-            _retry(_do_register, retry_times=_DEFAULT_RETRY_TIMES, interval=_DEFAULT_RETRY_INTERVAL)
+            utils.retry(_do_register, retry_times=60, interval=3)
             return True
         except Exception as e:
             logger.error("failed to register instance: %s", e)
@@ -267,7 +271,7 @@ class MotorCoordinatorClient(object):
 
         Posts to /instances/refresh with event=del.
         """
-        body = _build_body(
+        body = build_body(
             event="del",
             role=self.role,
             address=self.address,
@@ -278,7 +282,7 @@ class MotorCoordinatorClient(object):
             mgmt_url = "http://{}/instances/refresh".format(self.mgmt_endpoint)
             logger.info(
                 "unregistering instance from Motor Coordinator: %s  body=%s",
-                mgmt_url, json.dumps(body),
+                mgmt_url, body,
             )
             resp = requests.post(
                 mgmt_url,
@@ -286,7 +290,7 @@ class MotorCoordinatorClient(object):
                 headers=self.mgmt_headers,
                 timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_REGISTER_TIMEOUT),
             )
-            if resp.status_code != 200:
+            if not 200 <= resp.status_code < 300:
                 raise RuntimeError(
                     "unregister failed, url: {}, status_code: {}, content: {}".format(
                         mgmt_url, resp.status_code, resp.text
@@ -295,23 +299,9 @@ class MotorCoordinatorClient(object):
             logger.info("unregistered instance %d (%s) successfully", self.instance_id, self.role)
 
         try:
-            _retry(_do_unregister, retry_times=_DEFAULT_RETRY_TIMES, interval=_DEFAULT_RETRY_INTERVAL)
+            utils.retry(_do_unregister, retry_times=60, interval=3)
             return True
         except Exception as e:
             logger.error("failed to unregister instance: %s", e)
             traceback.print_exc()
             return False
-
-    # -----------------------------------------------------------------------
-    # internals
-    # -----------------------------------------------------------------------
-
-    @staticmethod
-    def _build_health_check_endpoint(worker_info: dict) -> str:
-        """Determine the local health-check address.
-
-        Uses POD_IP if available, otherwise falls back to localhost.
-        """
-        port = str(worker_info.get("port", "8000"))
-        pod_ip = os.getenv("POD_IP")
-        return "{}:{}".format(pod_ip, port) if pod_ip else "localhost:{}".format(port)
