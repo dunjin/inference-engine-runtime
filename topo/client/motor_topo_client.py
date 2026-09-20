@@ -192,6 +192,42 @@ class MotorTopoClient(GroupTopoClient):
             self.role, self.address, self.instance_id, self.mgmt_endpoint,
         )
 
+    def _resolve_model_name(self) -> Optional[str]:
+        """Resolve the engine model name for Coordinator registration.
+
+        Priority: MOTOR_MODEL_NAME env > probe the local engine /v1/models
+        (OpenAI-compatible, same endpoint Motor itself falls back to). The
+        resolved name is cached in self._model_name so unregister() still
+        carries it after the engine goes away — Motor's own fallback probe
+        would fail against a dead engine (del would 400).
+        """
+        if self._model_name:
+            return self._model_name
+        try:
+            resp = requests.get(
+                "http://{}/v1/models".format(self.health_check_endpoint),
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_HEALTH_CHECK_TIMEOUT),
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "engine /v1/models returned status=%s, keep model_name unset",
+                    resp.status_code,
+                )
+                return None
+            data = resp.json().get("data") or []
+            ids = [m["id"] for m in data if isinstance(m, dict) and m.get("id")]
+            if len(ids) == 1:
+                self._model_name = ids[0]
+                logger.info("resolved engine model name from /v1/models: %s", self._model_name)
+                return self._model_name
+            logger.warning(
+                "engine /v1/models returned %d model ids, expected exactly 1; "
+                "keep model_name unset", len(ids),
+            )
+        except Exception as e:
+            logger.warning("failed to resolve model name from engine /v1/models: %s", e)
+        return None
+
     # -----------------------------------------------------------------------
     # GroupTopoClient interface
     # -----------------------------------------------------------------------
@@ -230,6 +266,10 @@ class MotorTopoClient(GroupTopoClient):
         Posts to /instances/refresh with event=add.
         Idempotent when the instance-id already exists on the Coordinator.
         """
+        # Engine is guaranteed alive here (wait_engine_ready ran first), so
+        # resolve/cache the model name now — unregister() will reuse it after
+        # the engine is gone.
+        self._resolve_model_name()
         body = build_body(
             event="add",
             role=self.role,
@@ -270,12 +310,16 @@ class MotorTopoClient(GroupTopoClient):
         """Deregister the engine instance from the Motor Coordinator.
 
         Posts to /instances/refresh with event=del.
+        Carries the cached model name (resolved at register time): Motor
+        requires model_name for del too, and its fallback /v1/models probe
+        would fail against the already-dead engine.
         """
         body = build_body(
             event="del",
             role=self.role,
             address=self.address,
             instance_id=self.instance_id,
+            model_name=self._model_name,
         )
 
         def _do_unregister():

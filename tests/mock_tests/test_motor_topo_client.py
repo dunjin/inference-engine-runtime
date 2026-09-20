@@ -248,6 +248,74 @@ def test_register_posts_instances_refresh(mock_post, monkeypatch):
         url = call_args[0][0] if call_args[0] else call_args[1]["url"]
         assert "/instances/refresh" in url
         assert "demo-router-0.s-demo-router:9000" in url
+        # env-configured model name is carried (no /v1/models probe needed)
+        body = call_args[1]["json"]
+        assert body["model_name"] == "test-model"
+
+
+@patch("patio.topo.client.motor_topo_client.requests.post")
+def test_register_resolves_model_name_from_engine(mock_post, monkeypatch):
+    """register() probes the engine /v1/models when MOTOR_MODEL_NAME is unset,
+    caches the name, and sends it in the request body."""
+    _set_motor_env(monkeypatch)
+    monkeypatch.setenv("POD_IP", "10.0.0.1")
+    reload(envs)
+
+    response = MagicMock()
+    response.status_code = 200
+    response.text = "ok"
+    mock_post.return_value = response
+
+    with _patch_retry(), patch(
+        "patio.topo.client.motor_topo_client.requests.get"
+    ) as mock_get:
+        probe = MagicMock()
+        probe.status_code = 200
+        probe.json.return_value = {"data": [{"id": "Qwen2.5-7B"}]}
+        mock_get.return_value = probe
+
+        client = MotorTopoClient({"type": "prefill", "port": 8000})
+        assert client.register("", {"type": "prefill", "port": 8000})
+
+        # engine /v1/models probed once (health check not part of this test)
+        model_urls = [
+            c[0][0] for c in mock_get.call_args_list if "/v1/models" in c[0][0]
+        ]
+        assert len(model_urls) == 1
+        assert model_urls[0] == "http://10.0.0.1:8000/v1/models"
+
+        body = mock_post.call_args[1]["json"]
+        assert body["model_name"] == "Qwen2.5-7B"
+        # cached for unregister after the engine dies
+        assert client._model_name == "Qwen2.5-7B"
+
+
+@patch("patio.topo.client.motor_topo_client.requests.post")
+def test_register_omits_model_name_when_probe_fails(mock_post, monkeypatch):
+    """If the /v1/models probe fails, register proceeds without model_name and
+    lets Motor fall back to its own probe."""
+    _set_motor_env(monkeypatch)
+    monkeypatch.setenv("POD_IP", "10.0.0.1")
+    reload(envs)
+
+    response = MagicMock()
+    response.status_code = 200
+    response.text = "ok"
+    mock_post.return_value = response
+
+    with _patch_retry(), patch(
+        "patio.topo.client.motor_topo_client.requests.get"
+    ) as mock_get:
+        probe = MagicMock()
+        probe.status_code = 404
+        mock_get.return_value = probe
+
+        client = MotorTopoClient({"type": "prefill", "port": 8000})
+        assert client.register("", {"type": "prefill", "port": 8000})
+
+        body = mock_post.call_args[1]["json"]
+        assert "model_name" not in body
+        assert client._model_name is None
 
 
 @patch("patio.topo.client.motor_topo_client.requests.post")
@@ -274,6 +342,7 @@ def test_register_returns_false_on_error(mock_post, monkeypatch):
 def test_unregister_posts_instance_del(mock_post, monkeypatch):
     _set_motor_env(monkeypatch)
     monkeypatch.setenv("POD_IP", "10.0.0.1")
+    monkeypatch.setenv("MOTOR_MODEL_NAME", "test-model")
     reload(envs)
 
     response = MagicMock()
@@ -288,3 +357,39 @@ def test_unregister_posts_instance_del(mock_post, monkeypatch):
         call_kwargs = mock_post.call_args[1]
         body = call_kwargs["json"]
         assert body["event"] == "del"
+        # Motor requires model_name for del too; carried from env/cache
+        assert body["model_name"] == "test-model"
+
+
+@patch("patio.topo.client.motor_topo_client.requests.post")
+def test_unregister_carries_cached_model_name_after_engine_death(mock_post, monkeypatch):
+    """unregister() reuses the name resolved at register time even though the
+    engine is now dead (Motor's own fallback probe would 400 against it)."""
+    _set_motor_env(monkeypatch)
+    monkeypatch.setenv("POD_IP", "10.0.0.1")
+    reload(envs)
+
+    response = MagicMock()
+    response.status_code = 200
+    response.text = "ok"
+    mock_post.return_value = response
+
+    with _patch_retry(), patch(
+        "patio.topo.client.motor_topo_client.requests.get"
+    ) as mock_get:
+        probe = MagicMock()
+        probe.status_code = 200
+        probe.json.return_value = {"data": [{"id": "Qwen2.5-7B"}]}
+        mock_get.return_value = probe
+
+        client = MotorTopoClient({"type": "prefill", "port": 8000})
+        # register() resolves and caches the model name (engine alive then)
+        assert client.register("", {"type": "prefill", "port": 8000})
+        mock_get.reset_mock()
+        # engine dies; unregister must NOT probe /v1/models again
+        assert client.unregister()
+        mock_get.assert_not_called()
+
+        body = mock_post.call_args[1]["json"]
+        assert body["event"] == "del"
+        assert body["model_name"] == "Qwen2.5-7B"
