@@ -9,6 +9,16 @@ MindIE Motor Coordinator is a routing/control-plane component of the SAME
 abstraction class as the SGLang router and the vLLM proxy, so this client lives
 under topo/client/ and implements the shared GroupTopoClient interface, exactly
 like SGLangGroupTopoClient and VLLMProxyTopoClient.
+
+Standalone Motor Coordinator (``python3 -m motor.coordinator.register``) has NO
+active health-check loop of its own: instances registered through
+``/instances/refresh`` stay in the available pool until a ``del`` event is sent.
+Patio is a sidecar that shares the pod with the engine, so this client is the
+right place to (a) verify the engine is alive before (re-)registering and
+(b) deregister the instance once the engine becomes unhealthy — traffic stops
+being routed to a dead endpoint. ``register()`` is called periodically by the
+app heartbeat thread, so the health check runs on every heartbeat and a
+failed engine is deregistered within one heartbeat interval.
 """
 
 import os
@@ -29,16 +39,19 @@ logger = init_logger(__name__)
 STANDALONE_ID_NAMESPACE = 0x40000000
 STANDALONE_ID_MASK = 0x3FFFFFFF
 
-# Default dispatch plan accepted by Motor's external protocol.
-# Only "prefill_handoff_decode" and "concurrent_engine_sync" are valid.
-EXTERNAL_DISPATCH_PLAN = "prefill_handoff_decode"
-
-# Engine type as accepted by Motor's ExternalInsEventMsg protocol.
-# Motor standalone currently accepts "vllm" only.
+# Engine type accepted by Motor's InsEventMsg protocol. Motor standalone
+# currently accepts "vllm" only.
 MOTOR_ENGINE_TYPE = "vllm"
 
-# Motor management API key header (see mgmt_server_modified.py MGMT_API_KEY_HEADER)
+# Motor management API key header (see management_interfaces.md / register.py)
 MOTOR_MGMT_API_KEY_HEADER = "X-Motor-Management-Key"
+
+# Dispatch capability advertised for this P/D instance (see pd_disaggregation.md).
+MOTOR_DISPATCH_CAPABILITIES = ["prefill_handoff_decode"]
+
+# Instance / endpoint status values accepted by Motor's InsStatus / EndpointStatus.
+INSTANCE_STATUS_ACTIVE = "active"
+ENDPOINT_STATUS_NORMAL = "normal"
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +128,21 @@ def get_worker_address(worker_info: dict) -> str:
     raise RuntimeError("cannot determine worker address: set 'instance' field, POD_IP, or RBG env vars")
 
 
+def split_address(address: str) -> tuple[str, str]:
+    """Split a ``host:port`` address into (host, port).
+
+    Handles bare host without port (port defaults to 8000, matching the
+    worker_info default) as well as IPv4 / DNS host:port forms.
+    """
+    address = address.strip()
+    host, sep, port = address.rpartition(":")
+    if not sep or not host:
+        return address, "8000"
+    if not port.isdigit():
+        return address, "8000"
+    return host, port
+
+
 def derive_instance_id(role: str, address: str) -> int:
     """Deterministic instance ID matching Motor's CLI scheme.
 
@@ -128,29 +156,46 @@ def derive_instance_id(role: str, address: str) -> int:
     return STANDALONE_ID_NAMESPACE | digest
 
 
+def build_job_name(role: str, address: str, model_name: Optional[str]) -> str:
+    """Derive the job name following Motor CLI's ``{model}-{role}-{ip}-{port}`` scheme."""
+    host, port = split_address(address)
+    name = model_name or "unknown"
+    return "{}-{}-{}-{}".format(name, role, host, port)
+
+
 def build_body(event: str, role: str, address: str, instance_id: int,
                model_name: Optional[str] = None) -> dict:
-    """Build an ExternalInsEventMsg-compatible request body."""
-    body = {
-        "event": event,
+    """Build an InsEventMsg-compatible request body.
+
+    Schema (motor.common.resources.http_msg_spec.InsEventMsg):
+        {"event": "add"|"del", "instances": [Instance]}
+    where Instance requires job_name / model_name / id / role and exposes
+    endpoints as ``{pod_ip: {endpoint_id: Endpoint}}`` with Endpoint carrying
+    ``ip`` + ``business_port`` (not a combined "address" string).
+    """
+    host, port = split_address(address)
+    instance = {
+        "job_name": build_job_name(role, address, model_name),
+        "model_name": model_name or "unknown",
         "engine_type": MOTOR_ENGINE_TYPE,
-        "dispatch_capabilities": EXTERNAL_DISPATCH_PLAN,
-        "instances": [
-            {
-                "id": instance_id,
-                "role": role,
-                "endpoints": [
-                    {
-                        "id": 0,
-                        "address": address.strip(),
-                    }
-                ],
+        "dispatch_capabilities": list(MOTOR_DISPATCH_CAPABILITIES),
+        "id": instance_id,
+        "role": role,
+        "status": INSTANCE_STATUS_ACTIVE,
+        "enable_multi_endpoints": True,
+        "endpoints": {
+            host: {
+                "0": {
+                    "id": 0,
+                    "ip": host,
+                    "business_port": port,
+                    "status": ENDPOINT_STATUS_NORMAL,
+                    "headless": False,
+                }
             }
-        ],
+        },
     }
-    if model_name:
-        body["model_name"] = model_name
-    return body
+    return {"event": event, "instances": [instance]}
 
 
 def _build_health_check_endpoint(worker_info: dict) -> str:
@@ -187,6 +232,9 @@ class MotorTopoClient(GroupTopoClient):
         self.health_check_endpoint = _build_health_check_endpoint(worker_info)
 
         self._model_name = envs.MOTOR_MODEL_NAME
+        # Registration state mirror used by the heartbeat-driven health check:
+        # False until a register() succeeds, reset to False after an unregister().
+        self._registered = False
         logger.info(
             "MotorTopoClient: role=%s address=%s instance_id=%d endpoint=%s",
             self.role, self.address, self.instance_id, self.mgmt_endpoint,
@@ -232,24 +280,31 @@ class MotorTopoClient(GroupTopoClient):
     # GroupTopoClient interface
     # -----------------------------------------------------------------------
 
+    def _engine_healthy(self, worker_info: dict) -> bool:
+        """Probe the local engine /health endpoint once.
+
+        Returns True only on HTTP 200. Used by wait_engine_ready (polling
+        loop) and by register() (heartbeat-driven failure detection).
+        """
+        try:
+            resp = requests.get(
+                "http://" + self.health_check_endpoint + "/health",
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_HEALTH_CHECK_TIMEOUT),
+            )
+            return resp.status_code == 200
+        except requests.RequestException as e:
+            logger.debug("engine health probe failed: %s", e)
+            return False
+
     def wait_engine_ready(self, worker_info: dict) -> bool:
         """Poll the engine /health endpoint until it returns 200."""
         def _check():
-            try:
-                resp = requests.get(
-                    "http://" + self.health_check_endpoint + "/health",
-                    timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_HEALTH_CHECK_TIMEOUT),
-                )
-                if resp.status_code == 200:
-                    logger.info("Health check OK, inference engine is now ready.")
-                    return True
-                raise RuntimeError(
-                    "health check failed, url: {}, status_code: {}, content: {}".format(
-                        self.health_check_endpoint, resp.status_code, resp.text
-                    )
-                )
-            except requests.RequestException as e:
-                raise RuntimeError("health check request failed: {}".format(e))
+            if self._engine_healthy(worker_info):
+                logger.info("Health check OK, inference engine is now ready.")
+                return True
+            raise RuntimeError(
+                "health check failed, url: http://{}/health".format(self.health_check_endpoint)
+            )
 
         try:
             utils.retry(_check, retry_times=60, interval=3)
@@ -263,10 +318,25 @@ class MotorTopoClient(GroupTopoClient):
                  file_path: Optional[str] = None) -> bool:
         """Register the engine instance with the Motor Coordinator.
 
-        Posts to /instances/refresh with event=add.
-        Idempotent when the instance-id already exists on the Coordinator.
+        Posts to /instances/refresh with event=add. Idempotent when the
+        instance-id already exists on the Coordinator.
+
+        Health-gated: the app heartbeat thread calls register() periodically,
+        so this method doubles as the failure detector — if the engine is no
+        longer healthy we deregister the instance (event=del) instead of
+        re-adding it, so the Coordinator stops routing traffic to a dead
+        endpoint. A recovered engine re-registers on the next healthy call.
         """
-        # Engine is guaranteed alive here (wait_engine_ready ran first), so
+        if not self._engine_healthy(worker_info):
+            logger.warning(
+                "engine unhealthy at %s, deregistering instance %d (%s) from Motor Coordinator",
+                self.health_check_endpoint, self.instance_id, self.role,
+            )
+            if self._registered:
+                self.unregister()
+            return False
+
+        # Engine is guaranteed alive here (health gate above), so
         # resolve/cache the model name now — unregister() will reuse it after
         # the engine is gone.
         self._resolve_model_name()
@@ -300,6 +370,7 @@ class MotorTopoClient(GroupTopoClient):
 
         try:
             utils.retry(_do_register, retry_times=60, interval=3)
+            self._registered = True
             return True
         except Exception as e:
             logger.error("failed to register instance: %s", e)
@@ -314,6 +385,10 @@ class MotorTopoClient(GroupTopoClient):
         requires model_name for del too, and its fallback /v1/models probe
         would fail against the already-dead engine.
         """
+        if not self._registered:
+            logger.debug("instance %d is not registered, skipping unregister", self.instance_id)
+            return True
+
         body = build_body(
             event="del",
             role=self.role,
@@ -344,6 +419,7 @@ class MotorTopoClient(GroupTopoClient):
 
         try:
             utils.retry(_do_unregister, retry_times=60, interval=3)
+            self._registered = False
             return True
         except Exception as e:
             logger.error("failed to unregister instance: %s", e)

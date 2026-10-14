@@ -9,8 +9,11 @@ from patio import envs
 from patio.topo.client.motor_topo_client import (
     MotorTopoClient,
     build_body,
+    build_job_name,
     derive_instance_id,
     get_motor_endpoint,
+    get_worker_address,
+    split_address,
     STANDALONE_ID_NAMESPACE,
     STANDALONE_ID_MASK,
 )
@@ -37,6 +40,12 @@ def _set_motor_env(monkeypatch, group="demo", router_role="router",
         monkeypatch.setenv("MOTOR_MGMT_API_KEY_FILE", api_key_file)
 
 
+def _make_client(monkeypatch, worker_info=None, pod_ip="10.0.0.1"):
+    monkeypatch.setenv("POD_IP", pod_ip)
+    reload(envs)
+    return MotorTopoClient(worker_info or {"type": "prefill", "port": 8000})
+
+
 # ---------------------------------------------------------------------------
 # derive_instance_id
 # ---------------------------------------------------------------------------
@@ -57,6 +66,14 @@ def test_derive_instance_id_different_roles_yield_different_ids():
     prefill_id = derive_instance_id("prefill", "10.0.0.1:8000")
     decode_id = derive_instance_id("decode", "10.0.0.1:8000")
     assert prefill_id != decode_id
+
+
+def test_derive_instance_id_matches_motor_cli():
+    """Same derivation as motor/coordinator/register.py (role|ip:port)."""
+    instance_id = derive_instance_id("prefill", "10.10.0.11:8000")
+    assert instance_id == STANDALONE_ID_NAMESPACE | (
+        __import__("zlib").crc32(b"prefill|10.10.0.11:8000") & STANDALONE_ID_MASK
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,28 +111,90 @@ def test_get_motor_endpoint_raises_when_router_role_missing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# build_body
+# address helpers
+# ---------------------------------------------------------------------------
+
+def test_split_address_host_port():
+    assert split_address("10.0.0.1:8000") == ("10.0.0.1", "8000")
+
+
+def test_split_address_dns_name():
+    assert split_address("demo-prefill-0.s-demo-prefill:9000") == (
+        "demo-prefill-0.s-demo-prefill", "9000")
+
+
+def test_split_address_bare_host_defaults_port():
+    assert split_address("10.0.0.1") == ("10.0.0.1", "8000")
+
+
+def test_get_worker_address_prefers_explicit_instance(monkeypatch):
+    monkeypatch.setenv("POD_IP", "10.0.0.8")
+    assert get_worker_address({"instance": "custom-svc:8500", "port": 8500}) == "custom-svc:8500"
+
+
+def test_get_worker_address_uses_pod_ip(monkeypatch):
+    monkeypatch.setenv("POD_IP", "10.0.0.8")
+    assert get_worker_address({"port": 8102}) == "10.0.0.8:8102"
+
+
+def test_get_worker_address_uses_rbg_dns(monkeypatch):
+    monkeypatch.delenv("POD_IP", raising=False)
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_ROLE_NAME", "decode")
+    monkeypatch.setenv("RBG_ROLE_INDEX", "2")
+    assert get_worker_address({"port": 8102}) == "demo-decode-2.s-demo-decode:8102"
+
+
+def test_get_worker_address_raises_without_any_source(monkeypatch):
+    monkeypatch.delenv("POD_IP", raising=False)
+    monkeypatch.delenv("RBG_GROUP_NAME", raising=False)
+    monkeypatch.delenv("RBG_ROLE_NAME", raising=False)
+    monkeypatch.delenv("RBG_ROLE_INDEX", raising=False)
+
+    import pytest
+    with pytest.raises(RuntimeError, match="cannot determine worker address"):
+        get_worker_address({"port": 8102})
+
+
+# ---------------------------------------------------------------------------
+# build_body (InsEventMsg-compatible schema)
 # ---------------------------------------------------------------------------
 
 def test_build_body_add():
     body = build_body(event="add", role="prefill", address="10.0.0.1:8000",
                       instance_id=1073741825, model_name="Qwen-7B")
+    # InsEventMsg: only event + instances at the top level
+    assert set(body.keys()) == {"event", "instances"}
     assert body["event"] == "add"
-    assert body["engine_type"] == "vllm"
-    assert body["dispatch_capabilities"] == "prefill_handoff_decode"
-    assert body["model_name"] == "Qwen-7B"
     assert len(body["instances"]) == 1
     inst = body["instances"][0]
     assert inst["id"] == 1073741825
     assert inst["role"] == "prefill"
-    assert inst["endpoints"][0]["address"] == "10.0.0.1:8000"
+    assert inst["job_name"] == "Qwen-7B-prefill-10.0.0.1-8000"
+    assert inst["model_name"] == "Qwen-7B"
+    assert inst["engine_type"] == "vllm"
+    assert inst["dispatch_capabilities"] == ["prefill_handoff_decode"]
+    assert inst["status"] == "active"
+    # endpoints: dict[pod_ip][ep_id] -> Endpoint{id, ip, business_port}
+    assert inst["endpoints"]["10.0.0.1"]["0"]["ip"] == "10.0.0.1"
+    assert inst["endpoints"]["10.0.0.1"]["0"]["business_port"] == "8000"
+    assert inst["endpoints"]["10.0.0.1"]["0"]["id"] == 0
 
 
-def test_build_body_del_without_model_name():
+def test_build_body_del_uses_unknown_model_when_missing():
+    """model_name defaults to 'unknown' so Motor's required-field validation
+    still passes for del (CLI uses the same fallback)."""
     body = build_body(event="del", role="decode", address="10.0.0.2:8000",
                       instance_id=1073741826)
     assert body["event"] == "del"
-    assert "model_name" not in body
+    inst = body["instances"][0]
+    assert inst["model_name"] == "unknown"
+    assert inst["job_name"] == "unknown-decode-10.0.0.2-8000"
+
+
+def test_build_job_name():
+    assert build_job_name("prefill", "10.0.0.1:8000", "Qwen-7B") == "Qwen-7B-prefill-10.0.0.1-8000"
+    assert build_job_name("decode", "10.0.0.2:8001", None) == "unknown-decode-10.0.0.2-8001"
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +212,7 @@ def test_init_prefill(monkeypatch):
     assert client.role == "prefill"
     assert client.address == "10.0.0.1:8000"
     assert client.instance_id >= STANDALONE_ID_NAMESPACE
+    assert client._registered is False
 
 
 def test_init_decode(monkeypatch):
@@ -239,18 +319,31 @@ def test_register_posts_instances_refresh(mock_post, monkeypatch):
     response.text = "ok"
     mock_post.return_value = response
 
-    with _patch_retry():
+    with _patch_retry(), patch(
+        "patio.topo.client.motor_topo_client.requests.get"
+    ) as mock_get:
+        health = MagicMock()
+        health.status_code = 200
+        mock_get.return_value = health
+
         client = MotorTopoClient({"type": "prefill", "port": 8000})
         assert client.register("", {"type": "prefill", "port": 8000})
+        assert client._registered is True
+
         # Verify the POST went to the right URL with the right body
         call_args = mock_post.call_args
         assert call_args is not None
         url = call_args[0][0] if call_args[0] else call_args[1]["url"]
         assert "/instances/refresh" in url
         assert "demo-router-0.s-demo-router:9000" in url
-        # env-configured model name is carried (no /v1/models probe needed)
+        # InsEventMsg body: event + instances[]
         body = call_args[1]["json"]
-        assert body["model_name"] == "test-model"
+        assert body["event"] == "add"
+        assert body["instances"][0]["model_name"] == "test-model"
+        assert body["instances"][0]["id"] == client.instance_id
+        # env-configured model name means no /v1/models probe
+        model_urls = [c[0][0] for c in mock_get.call_args_list if "/v1/models" in c[0][0]]
+        assert model_urls == []
 
 
 @patch("patio.topo.client.motor_topo_client.requests.post")
@@ -269,15 +362,21 @@ def test_register_resolves_model_name_from_engine(mock_post, monkeypatch):
     with _patch_retry(), patch(
         "patio.topo.client.motor_topo_client.requests.get"
     ) as mock_get:
-        probe = MagicMock()
-        probe.status_code = 200
-        probe.json.return_value = {"data": [{"id": "Qwen2.5-7B"}]}
-        mock_get.return_value = probe
+        def _side_effect(url, *args, **kwargs):
+            if "/health" in url:
+                resp = MagicMock()
+                resp.status_code = 200
+                return resp
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"data": [{"id": "Qwen2.5-7B"}]}
+            return resp
+        mock_get.side_effect = _side_effect
 
         client = MotorTopoClient({"type": "prefill", "port": 8000})
         assert client.register("", {"type": "prefill", "port": 8000})
 
-        # engine /v1/models probed once (health check not part of this test)
+        # engine /v1/models probed once (health check is a separate /health call)
         model_urls = [
             c[0][0] for c in mock_get.call_args_list if "/v1/models" in c[0][0]
         ]
@@ -285,15 +384,15 @@ def test_register_resolves_model_name_from_engine(mock_post, monkeypatch):
         assert model_urls[0] == "http://10.0.0.1:8000/v1/models"
 
         body = mock_post.call_args[1]["json"]
-        assert body["model_name"] == "Qwen2.5-7B"
+        assert body["instances"][0]["model_name"] == "Qwen2.5-7B"
         # cached for unregister after the engine dies
         assert client._model_name == "Qwen2.5-7B"
 
 
 @patch("patio.topo.client.motor_topo_client.requests.post")
-def test_register_omits_model_name_when_probe_fails(mock_post, monkeypatch):
-    """If the /v1/models probe fails, register proceeds without model_name and
-    lets Motor fall back to its own probe."""
+def test_register_uses_unknown_model_when_probe_fails(mock_post, monkeypatch):
+    """If the /v1/models probe fails, model_name falls back to 'unknown' so the
+    required field still validates; Motor matches by instance id/endpoints."""
     _set_motor_env(monkeypatch)
     monkeypatch.setenv("POD_IP", "10.0.0.1")
     reload(envs)
@@ -306,15 +405,17 @@ def test_register_omits_model_name_when_probe_fails(mock_post, monkeypatch):
     with _patch_retry(), patch(
         "patio.topo.client.motor_topo_client.requests.get"
     ) as mock_get:
-        probe = MagicMock()
-        probe.status_code = 404
-        mock_get.return_value = probe
+        def _side_effect(url, *args, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200 if "/health" in url else 404
+            return resp
+        mock_get.side_effect = _side_effect
 
         client = MotorTopoClient({"type": "prefill", "port": 8000})
         assert client.register("", {"type": "prefill", "port": 8000})
 
         body = mock_post.call_args[1]["json"]
-        assert "model_name" not in body
+        assert body["instances"][0]["model_name"] == "unknown"
         assert client._model_name is None
 
 
@@ -329,9 +430,82 @@ def test_register_returns_false_on_error(mock_post, monkeypatch):
     response.text = "bad"
     mock_post.return_value = response
 
-    with _patch_retry():
+    with _patch_retry(), patch(
+        "patio.topo.client.motor_topo_client.requests.get"
+    ) as mock_get:
+        health = MagicMock()
+        health.status_code = 200
+        mock_get.return_value = health
+
         client = MotorTopoClient({"type": "prefill", "port": 8000})
         assert client.register("", {"type": "prefill", "port": 8000}) is False
+        assert client._registered is False
+
+
+# ---------------------------------------------------------------------------
+# heartbeat-driven failure detection: unhealthy engine -> deregister
+# ---------------------------------------------------------------------------
+
+@patch("patio.topo.client.motor_topo_client.requests.post")
+def test_register_skips_when_engine_unhealthy_and_not_registered(mock_post, monkeypatch):
+    """An unhealthy engine must not be (re-)registered."""
+    _set_motor_env(monkeypatch)
+    monkeypatch.setenv("POD_IP", "10.0.0.1")
+    reload(envs)
+
+    with _patch_retry(), patch(
+        "patio.topo.client.motor_topo_client.requests.get"
+    ) as mock_get:
+        health = MagicMock()
+        health.status_code = 503
+        mock_get.return_value = health
+
+        client = MotorTopoClient({"type": "prefill", "port": 8000})
+        assert client.register("", {"type": "prefill", "port": 8000}) is False
+        mock_post.assert_not_called()
+
+
+@patch("patio.topo.client.motor_topo_client.requests.post")
+def test_register_deregisters_when_engine_becomes_unhealthy(mock_post, monkeypatch):
+    """Multi-DP failure scenario: once the endpoint goes down, the heartbeat
+    thread's register() call must send event=del so the Coordinator stops
+    routing traffic to this (P) instance."""
+    _set_motor_env(monkeypatch)
+    monkeypatch.setenv("POD_IP", "10.0.0.1")
+    monkeypatch.setenv("MOTOR_MODEL_NAME", "test-model")
+    reload(envs)
+
+    response = MagicMock()
+    response.status_code = 200
+    response.text = "ok"
+    mock_post.return_value = response
+
+    with _patch_retry(), patch(
+        "patio.topo.client.motor_topo_client.requests.get"
+    ) as mock_get:
+        def _side_effect(url, *args, **kwargs):
+            resp = MagicMock()
+            # /health returns 200 first (healthy register), then 503 (engine died)
+            resp.status_code = 200 if "/health" in url and mock_get.call_count <= 1 else 503
+            return resp
+        mock_get.side_effect = _side_effect
+
+        client = MotorTopoClient({"type": "prefill", "port": 8000})
+        # first heartbeat: engine healthy -> add
+        assert client.register("", {"type": "prefill", "port": 8000}) is True
+        assert client._registered is True
+        events = [c[1]["json"]["event"] for c in mock_post.call_args_list]
+        assert events == ["add"]
+
+        # next heartbeat: engine dead -> must del (deregister)
+        assert client.register("", {"type": "prefill", "port": 8000}) is False
+        assert client._registered is False
+        events = [c[1]["json"]["event"] for c in mock_post.call_args_list]
+        assert events == ["add", "del"]
+
+        # del carries the cached model name (engine is dead, no re-probe)
+        del_body = mock_post.call_args_list[-1][1]["json"]
+        assert del_body["instances"][0]["model_name"] == "test-model"
 
 
 # ---------------------------------------------------------------------------
@@ -352,13 +526,26 @@ def test_unregister_posts_instance_del(mock_post, monkeypatch):
 
     with _patch_retry():
         client = MotorTopoClient({"type": "prefill", "port": 8000})
+        client._registered = True
         assert client.unregister()
         mock_post.assert_called_once()
         call_kwargs = mock_post.call_args[1]
         body = call_kwargs["json"]
         assert body["event"] == "del"
         # Motor requires model_name for del too; carried from env/cache
-        assert body["model_name"] == "test-model"
+        assert body["instances"][0]["model_name"] == "test-model"
+        assert client._registered is False
+
+
+@patch("patio.topo.client.motor_topo_client.requests.post")
+def test_unregister_skips_when_not_registered(mock_post, monkeypatch):
+    _set_motor_env(monkeypatch)
+    monkeypatch.setenv("POD_IP", "10.0.0.1")
+    reload(envs)
+
+    client = MotorTopoClient({"type": "prefill", "port": 8000})
+    assert client.unregister() is True
+    mock_post.assert_not_called()
 
 
 @patch("patio.topo.client.motor_topo_client.requests.post")
@@ -377,10 +564,16 @@ def test_unregister_carries_cached_model_name_after_engine_death(mock_post, monk
     with _patch_retry(), patch(
         "patio.topo.client.motor_topo_client.requests.get"
     ) as mock_get:
-        probe = MagicMock()
-        probe.status_code = 200
-        probe.json.return_value = {"data": [{"id": "Qwen2.5-7B"}]}
-        mock_get.return_value = probe
+        def _side_effect(url, *args, **kwargs):
+            if "/health" in url:
+                resp = MagicMock()
+                resp.status_code = 200
+                return resp
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"data": [{"id": "Qwen2.5-7B"}]}
+            return resp
+        mock_get.side_effect = _side_effect
 
         client = MotorTopoClient({"type": "prefill", "port": 8000})
         # register() resolves and caches the model name (engine alive then)
@@ -392,4 +585,4 @@ def test_unregister_carries_cached_model_name_after_engine_death(mock_post, monk
 
         body = mock_post.call_args[1]["json"]
         assert body["event"] == "del"
-        assert body["model_name"] == "Qwen2.5-7B"
+        assert body["instances"][0]["model_name"] == "Qwen2.5-7B"
