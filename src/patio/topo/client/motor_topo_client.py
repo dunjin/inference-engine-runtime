@@ -16,6 +16,21 @@ and a single P/D dispatch plan per registration. That matches Motor's standalone
 Coordinator, which routes P/D traffic only and whose CLI
 (``python3 -m motor.coordinator.register``) exposes the same two roles.
 
+One sidecar == one P/D instance == one *endpoint group*. A production instance is
+never a single endpoint: a DeepSeek-V4-Flash instance on one 16-NPU Atlas 800I A3
+node is dp4 x tp4 = 4 prefill endpoints (one vLLM API server per DP rank) or
+dp16 x tp1 = 16 decode endpoints. Motor derives ``dp_size = len(endpoints)`` and
+builds the multi-endpoint routing table from that list
+(``ExternalInsEventMsg.to_internal()``), so a sidecar advertising only its first
+endpoint registers a dp_size=1 instance: the Coordinator routes every request of
+the instance to one DP rank (1/4 of a prefill node, 1/16 of a decode node) and
+reports the wrong DP size. This client therefore always reports the complete
+group (``get_worker_endpoints``): an explicit ``endpoints`` list, an explicit
+``ports`` list, or ``parallel_config`` + ``device_num`` + ``base_port`` from
+which ports are derived exactly like Motor's own ``_generate_endpoint_ports``.
+The original single ``instance``/``port`` contract is still accepted and means a
+one-endpoint instance.
+
 MindIE Motor Coordinator is a routing/control-plane component of the SAME
 abstraction class as the SGLang router and the vLLM proxy, so this client lives
 under topo/client/ and implements the shared GroupTopoClient interface, exactly
@@ -25,17 +40,20 @@ Standalone Motor Coordinator (``python3 -m motor.coordinator.register``) has NO
 active health-check loop of its own: instances registered through
 ``/instances/refresh`` stay in the available pool until a ``del`` event is sent.
 Patio is a sidecar that shares the pod with the engine, so this client is the
-right place to (a) verify the engine is alive before (re-)registering and
-(b) deregister the instance once the engine becomes unhealthy — traffic stops
-being routed to a dead endpoint. ``register()`` is called periodically by the
-app heartbeat thread, so the health check runs on every heartbeat and a
-failed engine is deregistered within one heartbeat interval.
+right place to (a) verify the engine is alive on EVERY DP endpoint before
+(re-)registering and (b) deregister the instance once any endpoint becomes
+unhealthy — traffic stops being routed to a dead endpoint. ``register()`` is
+called periodically by the app heartbeat thread, so the health check runs on
+every heartbeat and a failed engine is deregistered within one heartbeat
+interval. The gate covers the whole endpoint group because Motor re-probes the
+group on ``add`` and rejects the instance when a single DP is unreachable.
 """
 
 import os
 import time
 import traceback
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import requests
@@ -74,6 +92,13 @@ MOTOR_MGMT_API_KEY_HEADER = "X-Motor-Management-Key"
 
 # Port assumed for a bare host without ":port" in worker_info.
 DEFAULT_ENGINE_PORT = "8000"
+
+# Motor's own port convention for the DP endpoints of one instance
+# (motor/config/node_manager.py: endpoint_config.base_port default 10000, and
+# service_ports = [base_port + i * port_step], port_step = 2). Used only when a
+# deployment hands Patio a DP size instead of an explicit endpoint list.
+DEFAULT_BASE_PORT = 10000
+DEFAULT_PORT_STEP = 2
 
 
 # ---------------------------------------------------------------------------
@@ -248,23 +273,169 @@ def format_address(host: str, port: str) -> str:
     return "[{}]:{}".format(host, port) if ":" in host else "{}:{}".format(host, port)
 
 
-def derive_instance_id(role: str, address: str) -> int:
+# ---------------------------------------------------------------------------
+# the endpoint group of one instance
+# ---------------------------------------------------------------------------
+
+
+def normalize_endpoint(item) -> str:
+    """Normalize one endpoint entry to a routable ``host:port`` address.
+
+    Accepts ``"host:port"`` strings and mappings carrying ``address`` (Motor's
+    own ExternalEndpoint field) or an ``ip``/``host`` + ``port``/``business_port``
+    pair, so a deployment can pass through whatever its inventory already holds.
+    """
+    if isinstance(item, dict):
+        address = item.get("address") or item.get("instance")
+        if address:
+            return str(address).strip()
+        host = item.get("ip") or item.get("host")
+        port = item.get("port") or item.get("business_port") or DEFAULT_ENGINE_PORT
+        if not host:
+            raise ValueError(
+                "endpoint entry {!r} carries neither 'address' nor 'ip'/'host'".format(item)
+            )
+        return format_address(str(host), str(port))
+    address = str(item).strip()
+    if not address:
+        raise ValueError("empty endpoint address in the instance endpoint group")
+    return address
+
+
+def sort_endpoints(addresses) -> list[str]:
+    """Return a group in Motor's canonical order, rejecting duplicates.
+
+    Motor's CLI (register.py, ``parse_endpoint_group``) sorts a group by
+    ``(ip, int(port))`` so the same physical group always derives the same
+    instance id regardless of input order, and Motor itself rejects an instance
+    carrying two identical ``(host, port)`` endpoints. Doing both here keeps the
+    instance id stable across restarts and turns a duplicated address into an
+    immediate, actionable error instead of a 400 after the request.
+    """
+    ordered: list[tuple[tuple[str, int], str]] = []
+    seen: set[tuple[str, int]] = set()
+    for address in addresses:
+        host, port = split_address(normalize_endpoint(address))
+        key = (host, int(port))
+        if key in seen:
+            raise ValueError(
+                "duplicate endpoint address {}:{} in the instance endpoint group".format(host, port)
+            )
+        seen.add(key)
+        ordered.append((key, format_address(host, port)))
+    ordered.sort(key=lambda item: item[0])
+    return [address for _, address in ordered]
+
+
+def derive_endpoint_ports(dp_size: int, local_world_size: int, device_num: int,
+                          base_port: int = DEFAULT_BASE_PORT,
+                          port_step: int = DEFAULT_PORT_STEP) -> list[str]:
+    """Derive an instance's DP endpoint ports exactly like Motor does.
+
+    Mirror of ``motor/config/node_manager.py::_generate_endpoint_ports``::
+
+        endpoint_num = min(dp_size, device_num // local_world_size)
+        service_ports = [base_port + i * port_step for i in range(endpoint_num)]
+
+    where ``local_world_size`` is the number of devices one DP rank occupies
+    (``tp_size * pp_size * pcp_size``) and ``device_num`` the NPUs of the node.
+    """
+    if dp_size < 1:
+        raise ValueError("dp_size must be >= 1, got {}".format(dp_size))
+    if local_world_size < 1:
+        raise ValueError("local_world_size must be >= 1, got {}".format(local_world_size))
+    if device_num < local_world_size:
+        raise ValueError(
+            "device_num {} is smaller than one DP rank's local_world_size {}".format(
+                device_num, local_world_size
+            )
+        )
+    endpoint_num = min(dp_size, device_num // local_world_size)
+    return [str(base_port + index * port_step) for index in range(endpoint_num)]
+
+
+def get_worker_endpoints(worker_info: dict) -> list[str]:
+    """Return EVERY routable DP endpoint of the instance this sidecar belongs to.
+
+    Resolution order (first match wins):
+
+    1. ``worker_info["endpoints"]`` — the authoritative, complete group; entries
+       are ``"host:port"`` strings or mappings (see :func:`normalize_endpoint`).
+       It may span pods (Motor keys endpoints by ip), so a group assembled by the
+       platform can be handed to a single sidecar.
+    2. ``MOTOR_INSTANCE_ENDPOINTS`` — comma separated ``host:port`` list, for
+       deployments that can only inject environment variables.
+    3. ``worker_info["ports"]`` — the DP ports of this pod's host.
+    4. ``worker_info["endpoint_num"]`` (or one derived from ``parallel_config`` /
+       ``device_num`` through :func:`derive_endpoint_ports`) plus
+       ``base_port``/``port_step`` — ports generated with Motor's convention.
+    5. the single ``instance``/``port``/RBG-DNS address: a one-endpoint instance.
+    """
+    explicit = worker_info.get("endpoints")
+    if explicit is None:
+        env_endpoints = os.getenv("MOTOR_INSTANCE_ENDPOINTS")
+        if env_endpoints and env_endpoints.strip():
+            explicit = [entry for entry in env_endpoints.split(",") if entry.strip()]
+    if explicit is not None:
+        if not isinstance(explicit, (list, tuple)) or not explicit:
+            raise ValueError(
+                "worker_info['endpoints'] must be a non-empty list of host:port entries"
+            )
+        return sort_endpoints(list(explicit))
+
+    host, _ = split_address(get_worker_address(worker_info))
+    base_port = worker_info.get("base_port") or os.getenv("MOTOR_BASE_PORT") or DEFAULT_BASE_PORT
+    port_step = worker_info.get("port_step") or os.getenv("MOTOR_PORT_STEP") or DEFAULT_PORT_STEP
+
+    ports = worker_info.get("ports")
+    if ports is None:
+        endpoint_num = worker_info.get("endpoint_num") or os.getenv("MOTOR_ENDPOINT_NUM")
+        if endpoint_num is None:
+            parallel_config = worker_info.get("parallel_config") or {}
+            dp_size = parallel_config.get("dp_size", worker_info.get("data_parallel_size"))
+            device_num = worker_info.get("device_num", worker_info.get("npu_num"))
+            if dp_size is not None and device_num is not None:
+                local_world_size = parallel_config.get("local_world_size")
+                if local_world_size is None:
+                    local_world_size = (
+                        int(parallel_config.get("tp_size", 1))
+                        * int(parallel_config.get("pp_size", 1))
+                        * int(parallel_config.get("pcp_size", 1))
+                    )
+                ports = derive_endpoint_ports(
+                    int(dp_size), int(local_world_size), int(device_num),
+                    int(base_port), int(port_step),
+                )
+        elif int(endpoint_num) > 0:
+            ports = [
+                str(int(base_port) + index * int(port_step)) for index in range(int(endpoint_num))
+            ]
+
+    if ports:
+        return sort_endpoints([format_address(host, str(port)) for port in ports])
+    return [get_worker_address(worker_info)]
+
+
+def derive_instance_id(role: str, endpoints) -> int:
     """Deterministic instance ID matching Motor's CLI scheme.
 
-    Motor CLI (register.py, derive_instance_id):
-        identity = "role|ip:port"
+    Motor CLI (``register.py``, ``derive_instance_id``)::
+
+        identity = "<role>|<ip:port>|<ip:port>|..."   # sorted by (ip, int(port))
         digest = crc32(identity) & 0x3FFFFFFF
         return 0x40000000 | digest
 
-    A sidecar registers the very same ID for the same role/endpoint pair, so a
-    CLI-registered and a sidecar-registered instance are the same instance.
+    The identity covers the COMPLETE endpoint group, not just its first endpoint,
+    so a multi-endpoint instance derives the same id Motor's CLI derives for that
+    group. A one-endpoint instance keeps the historical ``role|host:port`` id.
     """
-    identity = "{}|{}".format(role, address.strip())
+    addresses = sort_endpoints([endpoints] if isinstance(endpoints, str) else list(endpoints))
+    identity = "|".join([role, *addresses])
     digest = zlib.crc32(identity.encode()) & STANDALONE_ID_MASK
     return STANDALONE_ID_NAMESPACE | digest
 
 
-def build_body(event: str, role: str, address: str, instance_id: int,
+def build_body(event: str, role: str, endpoints, instance_id: int,
                model_name: Optional[str] = None) -> dict:
     """Build an ExternalInsEventMsg request body for /instances/refresh.
 
@@ -277,12 +448,18 @@ def build_body(event: str, role: str, address: str, instance_id: int,
          "instances": [{"id": <int >=1>, "role": "prefill"|"decode",
                         "endpoints": [{"id": <int >=0>, "address": "host:port"}]}]}
 
+    ``endpoints`` is the instance's COMPLETE group (a single address, or an
+    iterable of addresses); ``endpoint.id`` is the DP rank, so a group of N
+    endpoints is emitted as ids 0..N-1 in canonical order. Motor keys them by ip
+    (an instance may therefore span pods) and derives
+    ``dp_size = len(endpoints)`` in ExternalInsEventMsg.to_internal().
+
     The schema is ``extra="forbid"``: job name, status, DP size and
-    multi-endpoint routing are NOT part of it — Motor derives them in
-    ExternalInsEventMsg.to_internal(). A request may not mix this shape with the
-    Controller-shaped InsEventMsg fields (``job_name``, ``endpoints`` as a dict).
+    multi-endpoint routing are NOT part of it. A request may not mix this shape
+    with the Controller-shaped InsEventMsg fields (``job_name``, ``endpoints``
+    as a dict).
     """
-    host, port = split_address(address)
+    addresses = sort_endpoints([endpoints] if isinstance(endpoints, str) else list(endpoints))
     body = {
         "event": event,
         "dispatch_capabilities": get_dispatch_capability(),
@@ -291,7 +468,10 @@ def build_body(event: str, role: str, address: str, instance_id: int,
             {
                 "id": instance_id,
                 "role": role,
-                "endpoints": [{"id": 0, "address": format_address(host, port)}],
+                "endpoints": [
+                    {"id": index, "address": address}
+                    for index, address in enumerate(addresses)
+                ],
             }
         ],
     }
@@ -302,16 +482,6 @@ def build_body(event: str, role: str, address: str, instance_id: int,
     if model_name:
         body["model_name"] = model_name
     return body
-
-
-def _build_health_check_endpoint(worker_info: dict) -> str:
-    """Determine the local health-check address.
-
-    Uses POD_IP if available, otherwise falls back to localhost.
-    """
-    port = str(worker_info.get("port", "8000"))
-    pod_ip = os.getenv("POD_IP")
-    return "{}:{}".format(pod_ip, port) if pod_ip else "localhost:{}".format(port)
 
 
 # ---------------------------------------------------------------------------
@@ -333,17 +503,27 @@ class MotorTopoClient(GroupTopoClient):
         self.mgmt_endpoint = get_motor_endpoint()
         self.mgmt_headers = get_mgmt_headers()
         self.role = detect_worker_type(worker_info)
-        self.address = get_worker_address(worker_info)
-        self.instance_id = derive_instance_id(self.role, self.address)
-        self.health_check_endpoint = _build_health_check_endpoint(worker_info)
+        # Complete DP endpoint group of this instance (never just one endpoint:
+        # Motor derives dp_size from the group size — see get_worker_endpoints).
+        self.endpoints = get_worker_endpoints(worker_info)
+        # ``address`` is kept for compatibility; the registration payload and the
+        # health gate both operate on the COMPLETE group.
+        self.address = self.endpoints[0]
+        # The gate probes every registered endpoint: Motor re-probes the whole
+        # group on add and rejects the instance when one DP is unreachable, so
+        # probing only the local rank would let a partially dead group through.
+        self.health_check_endpoints = list(self.endpoints)
+        self.health_check_endpoint = self.health_check_endpoints[0]
+        self.instance_id = derive_instance_id(self.role, self.endpoints)
 
         self._model_name = envs.MOTOR_MODEL_NAME
         # Registration state mirror used by the heartbeat-driven health check:
         # False until a register() succeeds, reset to False after an unregister().
         self._registered = False
         logger.info(
-            "MotorTopoClient: role=%s address=%s instance_id=%d endpoint=%s",
-            self.role, self.address, self.instance_id, self.mgmt_endpoint,
+            "MotorTopoClient: role=%s instance_id=%d dp_endpoints=%d [%s] coordinator=%s",
+            self.role, self.instance_id, len(self.endpoints),
+            ", ".join(self.endpoints), self.mgmt_endpoint,
         )
 
     def _resolve_model_name(self) -> Optional[str]:
@@ -386,21 +566,50 @@ class MotorTopoClient(GroupTopoClient):
     # GroupTopoClient interface
     # -----------------------------------------------------------------------
 
-    def _engine_healthy(self, worker_info: dict) -> bool:
-        """Probe the local engine /health endpoint once.
-
-        Returns True only on HTTP 200. Used by wait_engine_ready (polling
-        loop) and by register() (heartbeat-driven failure detection).
-        """
+    @staticmethod
+    def _probe_endpoint_health(address: str) -> tuple[str, bool, str]:
+        """GET ``http://<address>/health`` once; return (address, healthy, reason)."""
         try:
             resp = requests.get(
-                "http://" + self.health_check_endpoint + "/health",
+                "http://" + address + "/health",
                 timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_HEALTH_CHECK_TIMEOUT),
             )
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                return address, True, ""
+            return address, False, "status {}".format(resp.status_code)
         except requests.RequestException as e:
-            logger.debug("engine health probe failed: %s", e)
+            return address, False, str(e)
+
+    def _engine_healthy(self, worker_info: dict) -> bool:
+        """Probe EVERY DP endpoint's /health endpoint; True only if all pass.
+
+        One sidecar owns one P/D instance, i.e. one DP endpoint group. Motor
+        re-probes the whole group on add (model discovery/verification) and
+        rejects the entire instance when a single DP is unreachable, so the gate
+        must cover the group — a local-only probe would register a group Motor
+        is about to reject. Probes run concurrently to keep the heartbeat
+        bounded when a node hosts many DPs (up to 16).
+        """
+        targets = self.health_check_endpoints
+        if len(targets) == 1:
+            results = [self._probe_endpoint_health(targets[0])]
+        else:
+            max_workers = min(8, len(targets))
+            with ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="motor-health"
+            ) as executor:
+                results = list(executor.map(self._probe_endpoint_health, targets))
+        failures = [
+            (address, reason) for address, healthy, reason in results if not healthy
+        ]
+        if failures:
+            logger.warning(
+                "engine health gate failed for %d/%d DP endpoint(s): %s",
+                len(failures), len(targets),
+                "; ".join("{} ({})".format(address, reason) for address, reason in failures),
+            )
             return False
+        return True
 
     def wait_engine_ready(self, worker_info: dict) -> bool:
         """Poll the engine /health endpoint until it returns 200."""
@@ -409,7 +618,10 @@ class MotorTopoClient(GroupTopoClient):
                 logger.info("Health check OK, inference engine is now ready.")
                 return True
             raise RuntimeError(
-                "health check failed, url: http://{}/health".format(self.health_check_endpoint)
+                "health check failed, urls: {}".format(
+                    ", ".join("http://{}/health".format(endpoint)
+                              for endpoint in self.health_check_endpoints)
+                )
             )
 
         try:
@@ -426,6 +638,11 @@ class MotorTopoClient(GroupTopoClient):
 
         Posts to /instances/refresh with event=add. Idempotent when the
         instance-id already exists on the Coordinator.
+
+        The body carries this instance's COMPLETE DP endpoint group: Motor
+        derives dp_size from it and builds the multi-endpoint routing table, so
+        advertising a single endpoint would pin the whole instance to one DP
+        rank.
 
         Health-gated: the app heartbeat thread calls register() periodically,
         so this method doubles as the failure detector — if the engine is no
@@ -449,7 +666,7 @@ class MotorTopoClient(GroupTopoClient):
         body = build_body(
             event="add",
             role=self.role,
-            address=self.address,
+            endpoints=self.endpoints,
             instance_id=self.instance_id,
             model_name=self._model_name,
         )
@@ -466,18 +683,34 @@ class MotorTopoClient(GroupTopoClient):
                 headers=self.mgmt_headers,
                 timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_REGISTER_TIMEOUT),
             )
+            if 400 <= resp.status_code < 500:
+                # Deterministic rejection (e.g. 409 when the same instance id is
+                # already registered with a different shape, or 400 for a
+                # payload Motor refuses). Retrying cannot help, and this runs in
+                # the 10s heartbeat: returning instead of raising keeps a
+                # permanent 4xx from blocking the heartbeat thread for the whole
+                # 60 x 3s registration budget on every single beat.
+                logger.error(
+                    "Motor Coordinator rejected registration of instance %d (%s), "
+                    "status_code=%s, content=%s; not retrying",
+                    self.instance_id, self.role, resp.status_code, resp.text,
+                )
+                return False
             if not 200 <= resp.status_code < 300:
                 raise RuntimeError(
                     "register failed, url: {}, status_code: {}, content: {}".format(
                         mgmt_url, resp.status_code, resp.text
                     )
                 )
-            logger.info("registered instance %d (%s) successfully", self.instance_id, self.role)
+            logger.info(
+                "registered instance %d (%s) with %d DP endpoint(s) successfully",
+                self.instance_id, self.role, len(self.endpoints),
+            )
+            return True
 
         try:
-            utils.retry(_do_register, retry_times=60, interval=3)
-            self._registered = True
-            return True
+            self._registered = bool(utils.retry(_do_register, retry_times=60, interval=3))
+            return self._registered
         except Exception as e:
             logger.error("failed to register instance: %s", e)
             traceback.print_exc()
@@ -487,6 +720,10 @@ class MotorTopoClient(GroupTopoClient):
         """Deregister the engine instance from the Motor Coordinator.
 
         Posts to /instances/refresh with event=del.
+        Carries the same COMPLETE endpoint group that register() advertised:
+        Motor identifies a deletion by role plus the physical endpoint set
+        (motor/coordinator/domain/instance_manager.py, _same_delete_identity) and
+        rejects a partial group with a 409 InstanceIdConflictError.
         Carries the cached model name (resolved at register time): Motor
         requires model_name for del too, and its fallback /v1/models probe
         would fail against the already-dead engine.
@@ -506,7 +743,7 @@ class MotorTopoClient(GroupTopoClient):
         body = build_body(
             event="del",
             role=self.role,
-            address=self.address,
+            endpoints=self.endpoints,
             instance_id=self.instance_id,
             model_name=self._model_name,
         )
